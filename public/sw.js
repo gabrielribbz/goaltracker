@@ -1,149 +1,170 @@
-// Service Worker para Notificações Push - Tracker de Objetivos
+// Service Worker - Tracker de Objetivos
+// Usa Periodic Background Sync + IndexedDB para notificações confiáveis a cada 2h
 
-const NOTIFICATION_INTERVAL = 2 * 60 * 60 * 1000; // 2 horas em milissegundos
+const SYNC_TAG = 'goal-reminder';
+const DB_NAME = 'goal-tracker-db';
+const DB_VERSION = 1;
+const GOALS_STORE = 'goals';
+const SETTINGS_STORE = 'settings';
 
-// Quando o service worker é instalado
-self.addEventListener('install', (event) => {
-  self.skipWaiting();
+// ===== IndexedDB Helpers =====
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(GOALS_STORE)) {
+        db.createObjectStore(GOALS_STORE, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(SETTINGS_STORE)) {
+        db.createObjectStore(SETTINGS_STORE, { keyPath: 'key' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveGoals(goals) {
+  const db = await openDB();
+  const tx = db.transaction(GOALS_STORE, 'readwrite');
+  const store = tx.objectStore(GOALS_STORE);
+  store.clear();
+  goals.forEach((g) => store.put(g));
+  return new Promise((res, rej) => {
+    tx.oncomplete = () => { db.close(); res(); };
+    tx.onerror = () => { db.close(); rej(tx.error); };
+  });
+}
+
+async function getGoals() {
+  const db = await openDB();
+  const tx = db.transaction(GOALS_STORE, 'readonly');
+  const req = tx.objectStore(GOALS_STORE).getAll();
+  return new Promise((res, rej) => {
+    req.onsuccess = () => { db.close(); res(req.result); };
+    req.onerror = () => { db.close(); rej(req.error); };
+  });
+}
+
+async function saveSetting(key, value) {
+  const db = await openDB();
+  const tx = db.transaction(SETTINGS_STORE, 'readwrite');
+  tx.objectStore(SETTINGS_STORE).put({ key, value });
+  return new Promise((res) => {
+    tx.oncomplete = () => { db.close(); res(); };
+    tx.onerror = () => { db.close(); res(); };
+  });
+}
+
+// ===== Lifecycle =====
+
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
+
+// ===== Periodic Background Sync (principal) =====
+
+self.addEventListener('periodicsync', (event) => {
+  if (event.tag === SYNC_TAG) {
+    event.waitUntil(sendGoalReminder());
+  }
 });
 
-// Quando o service worker é ativado
-self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
-});
+// ===== Mensagens do App =====
 
-// Escuta mensagens do app principal
 self.addEventListener('message', (event) => {
   const { type, goals } = event.data;
 
-  if (type === 'START_NOTIFICATIONS') {
-    // Salva os goals no cache para usar nas notificações
-    self.goalsData = goals || [];
-    startNotificationTimer();
-  }
-
-  if (type === 'STOP_NOTIFICATIONS') {
-    stopNotificationTimer();
-  }
-
   if (type === 'UPDATE_GOALS') {
-    self.goalsData = goals || [];
+    saveGoals(goals || []);
   }
 
   if (type === 'SEND_TEST') {
-    sendGoalReminder();
+    event.waitUntil(sendGoalReminder());
+  }
+
+  if (type === 'STOP_NOTIFICATIONS') {
+    // Limpa dados se necessário
   }
 });
 
-let notificationTimer = null;
+// ===== Lógica de Notificação =====
 
-function startNotificationTimer() {
-  stopNotificationTimer(); // Limpa qualquer timer existente
-  
-  // Dispara a primeira notificação após o intervalo
-  notificationTimer = setInterval(() => {
-    sendGoalReminder();
-  }, NOTIFICATION_INTERVAL);
-}
-
-function stopNotificationTimer() {
-  if (notificationTimer) {
-    clearInterval(notificationTimer);
-    notificationTimer = null;
+async function sendGoalReminder() {
+  let goals = [];
+  try {
+    goals = await getGoals();
+  } catch (err) {
+    console.error('Erro ao ler goals do IndexedDB:', err);
   }
-}
 
-function sendGoalReminder() {
-  const goals = self.goalsData || [];
-  
+  await saveSetting('lastNotificationTime', Date.now());
+
   if (goals.length === 0) {
-    self.registration.showNotification('🎯 Tracker de Objetivos', {
+    return self.registration.showNotification('🎯 Tracker de Objetivos', {
       body: 'Você ainda não tem objetivos cadastrados. Que tal criar um agora?',
       icon: '/notification-icon.png',
       badge: '/notification-icon.png',
       tag: 'goal-reminder',
       renotify: true,
-      requireInteraction: false,
-      actions: [
-        { action: 'open', title: 'Abrir App' }
-      ]
+      actions: [{ action: 'open', title: 'Abrir App' }],
     });
-    return;
   }
 
-  // Filtra objetivos não concluídos
-  const pendingGoals = goals.filter(g => g.currentValue < g.targetValue);
-  const completedCount = goals.length - pendingGoals.length;
+  const pending = goals.filter((g) => g.currentValue < g.targetValue);
 
-  if (pendingGoals.length === 0) {
-    self.registration.showNotification('🏆 Todos os objetivos alcançados!', {
+  if (pending.length === 0) {
+    return self.registration.showNotification('🏆 Todos os objetivos alcançados!', {
       body: `Parabéns! Você completou todos os ${goals.length} objetivos. Hora de criar novos sonhos!`,
       icon: '/notification-icon.png',
       badge: '/notification-icon.png',
       tag: 'goal-reminder',
       renotify: true,
     });
-    return;
   }
 
-  // Pega um objetivo aleatório para destacar
-  const randomGoal = pendingGoals[Math.floor(Math.random() * pendingGoals.length)];
-  const progress = ((randomGoal.currentValue / randomGoal.targetValue) * 100).toFixed(0);
-  
-  const formatCurrency = (value) => {
-    return new Intl.NumberFormat('pt-BR', {
-      style: 'currency',
-      currency: 'BRL',
-    }).format(value);
-  };
+  const goal = pending[Math.floor(Math.random() * pending.length)];
+  const progress = ((goal.currentValue / goal.targetValue) * 100).toFixed(0);
+  const fmt = (v) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v);
+  const remaining = fmt(goal.targetValue - goal.currentValue);
 
-  const remaining = formatCurrency(randomGoal.targetValue - randomGoal.currentValue);
-
-  // Varia as mensagens para não ficar repetitivo
   const messages = [
-    `💪 "${randomGoal.title}" está em ${progress}%! Faltam ${remaining} para alcançar sua meta.`,
-    `🔥 Você já progrediu ${progress}% em "${randomGoal.title}"! Continue assim!`,
-    `📊 Lembrete: "${randomGoal.title}" precisa de mais ${remaining}. Você consegue!`,
-    `⭐ Não esqueça do seu objetivo "${randomGoal.title}"! Já são ${progress}% concluídos.`,
-    `🚀 Foco em "${randomGoal.title}"! Faltam apenas ${remaining} para a meta.`,
+    `💪 "${goal.title}" está em ${progress}%! Faltam ${remaining} para alcançar sua meta.`,
+    `🔥 Você já progrediu ${progress}% em "${goal.title}"! Continue assim!`,
+    `📊 Lembrete: "${goal.title}" precisa de mais ${remaining}. Você consegue!`,
+    `⭐ Não esqueça do seu objetivo "${goal.title}"! Já são ${progress}% concluídos.`,
+    `🚀 Foco em "${goal.title}"! Faltam apenas ${remaining} para a meta.`,
   ];
 
-  const body = messages[Math.floor(Math.random() * messages.length)];
-
-  const title = pendingGoals.length === 1
+  const title = pending.length === 1
     ? '🎯 Lembrete do seu Objetivo'
-    : `🎯 Você tem ${pendingGoals.length} objetivos em andamento`;
+    : `🎯 Você tem ${pending.length} objetivos em andamento`;
 
-  self.registration.showNotification(title, {
-    body,
+  return self.registration.showNotification(title, {
+    body: messages[Math.floor(Math.random() * messages.length)],
     icon: '/notification-icon.png',
     badge: '/notification-icon.png',
     tag: 'goal-reminder',
     renotify: true,
     requireInteraction: false,
     data: { url: '/' },
-    actions: [
-      { action: 'open', title: 'Ver Objetivos' }
-    ]
+    actions: [{ action: 'open', title: 'Ver Objetivos' }],
   });
 }
 
-// Quando o usuário clica na notificação
+// ===== Clique na Notificação =====
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      // Se já tem uma aba aberta, foca nela
-      for (const client of clientList) {
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+      for (const client of clients) {
         if (client.url.includes(self.location.origin) && 'focus' in client) {
           return client.focus();
         }
       }
-      // Senão, abre uma nova aba
-      if (self.clients.openWindow) {
-        return self.clients.openWindow('/');
-      }
+      if (self.clients.openWindow) return self.clients.openWindow('/');
     })
   );
 });
